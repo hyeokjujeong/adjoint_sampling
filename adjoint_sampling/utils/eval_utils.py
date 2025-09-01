@@ -706,7 +706,7 @@ def eval_batch(
     ref_mols = read_xyz_files(xyz_path)
 
     threshold_ranges = np.arange(0, 2.5, 0.125)
-    rmsd_array = calc_rmsd(gen_mols, ref_mols, True)
+    rmsd_array = calc_rmsd(gen_mols, ref_mols)
     stats_ = calc_performance_stats(rmsd_array, threshold_ranges)
 
     if stats_ is not None:
