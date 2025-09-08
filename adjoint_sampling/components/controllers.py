@@ -123,6 +123,73 @@ class EGNN_dynamics_torsion(EGNN_dynamics):
         )
 
 
+from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
+
+class IGNN_value(nn.Module):
+    def __init__(
+        self,
+        n_atoms=10,
+        hidden_nf=64,
+        n_layers=4,
+        agg="sum",
+        uniform=False,
+        pooling="sum", # "sum", "mean", "max"
+        n_mlp_layers=2,
+    ):
+        super().__init__()
+        in_node_nf = n_atoms + 1 if not uniform else 1
+        in_edge_nf = 3 if not uniform else 1
+        self.uniform = uniform
+        self.ignn = IGNN(
+            in_node_nf=in_node_nf,
+            in_edge_nf=in_edge_nf,
+            hidden_nf=hidden_nf,
+            n_layers=n_layers,
+            agg=agg,
+        )
+        self.pooling = pooling
+        self.n_mlp_layers = n_mlp_layers
+        # MLP
+        mlp = []
+        for i in range(self.n_mlp_layers - 1):
+            # Use same MLP architecture (Layernorm + SiLU) as in GNN layers
+            mlp.append(nn.Linear(hidden_nf, hidden_nf))
+            mlp.append(nn.LayerNorm(hidden_nf))
+            mlp.append(nn.SiLU())
+        mlp.append(nn.Linear(hidden_nf, 1))
+        self.mlp = nn.Sequential(*mlp)
+
+    def forward(self, t, batch):
+
+        x = batch["positions"]
+        edge_index = batch["edge_index"]
+        batch_index = batch["batch"]
+        h = torch.ones(x.shape[0], 1).to(x.device)
+        h = h * t[batch_index, None]
+
+        edge_attr = torch.sum(
+            (x[edge_index[0]] - x[edge_index[1]]) ** 2, dim=1, keepdim=True
+        )  # .double()
+        if not self.uniform:
+            h_atom_types = batch["node_attrs"]  # .double()
+            h = torch.cat([h_atom_types, h], dim=-1)  # .double()
+            bond_one_hot = torch.nn.functional.one_hot(batch["edge_attrs"][:, 1].long())
+            edge_attr = torch.cat([bond_one_hot, edge_attr], dim=-1)
+        h = self.ignn(h, edge_index, edge_attr)
+
+        if self.pooling == "sum":
+            g = global_add_pool(h, batch_index)    # (B, hidden_nf)
+        elif self.pooling == "mean":
+            g = global_mean_pool(h, batch_index)   # (B, hidden_nf)
+        elif self.pooling == "max":
+            g = global_max_pool(h, batch_index)    # (B, hidden_nf)
+        else:
+            raise ValueError(f"Unknown pooling: {self.pooling}")
+        # Single output value per graph
+        out = self.mlp(g)
+        return out # (B, 1)
+    
+
 class EGNN(nn.Module):
     def __init__(
         self,
@@ -169,6 +236,42 @@ class EGNN(nn.Module):
         #     h = h * node_mask
         return x, h
 
+
+class IGNN(nn.Module):
+    def __init__(
+        self,
+        in_node_nf,
+        in_edge_nf,
+        hidden_nf,
+        n_layers=4,
+        agg="sum",
+    ):
+        super().__init__()
+        self.hidden_nf = hidden_nf
+        self.n_layers = n_layers
+        # Encoder
+        self.embedding = nn.Linear(in_node_nf, self.hidden_nf)
+        for i in range(0, n_layers):
+            self.add_module(
+                "gcl_%d" % i,
+                I_GCL(
+                    self.hidden_nf,
+                    self.hidden_nf,
+                    in_edge_nf,
+                    hidden_channels=self.hidden_nf,
+                    aggr=agg,
+                ),
+            )
+
+
+    def forward(self, h, edges, edge_attr):
+
+        h = self.embedding(h)
+        for i in range(0, self.n_layers):
+            h = self._modules["gcl_%d" % i](h, edge_attr, edges)
+
+        return h
+    
 
 class ResWrapper(torch.nn.Module):
     def __init__(self, module, dim_res=2):
@@ -242,6 +345,70 @@ class E_GCL(MessagePassing):
         x_l1 = x + (m_x / c)
         return x_l1, h_l1
 
+
+class I_GCL(MessagePassing):
+    """
+    E(n)-Invariant GNN layer
+
+    Concept:
+      - Update node scalars h using only E(n)-invariant edge features
+        (e.g., squared distances), ensuring outputs are invariant under
+        rotations/translations/reflections when inputs are invariant.
+      - No coordinate updates (x is not used).
+
+    Invariance Conditions:
+      - Node features h are independent of global frame.
+      - Edge features are E(n)-invariant scalars such as ||x_i - x_j||^2.
+
+    Reference: Based on the feature/message update part of EGNN
+       https://arxiv.org/pdf/2102.09844.pdf, but without coordinate updates.
+    """
+
+    def __init__(
+        self,
+        channels_h: Union[int, Tuple[int, int]],
+        channels_m: Union[int, Tuple[int, int]],
+        channels_a: Union[int, Tuple[int, int]],
+        aggr: str = "add",
+        hidden_channels: int = 64,
+        **kwargs,
+    ):
+        super(I_GCL, self).__init__(aggr=aggr, **kwargs)
+
+        self.phi_e = nn.Sequential(
+            nn.Linear(2 * channels_h + channels_a, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, channels_m),
+            nn.LayerNorm(channels_m),
+            nn.SiLU(),
+        )
+        self.phi_h = ResWrapper(
+            nn.Sequential(
+                nn.Linear(channels_h + channels_m, hidden_channels),
+                nn.LayerNorm(hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, channels_h),
+            ),
+            dim_res=channels_h,
+        )
+
+    def forward(self, h, edge_attr, edge_index):
+        return self.propagate(edge_index=edge_index, h=h, edge_attr=edge_attr)
+
+    def message(self, h_i, h_j, edge_attr):
+        mh_ij = self.phi_e(
+            torch.cat(
+                [h_i, h_j, edge_attr],
+                dim=-1,
+            )
+        )
+        return mh_ij
+
+    def update(self, aggr_out, h, edge_attr):
+        h_l1 = self.phi_h(torch.cat([h, aggr_out], dim=-1))
+        return h_l1
+    
 
 def update_batch_for_fairchem(batch):
     natoms = batch.batch.new_zeros(batch.batch.max().item() + 1)
