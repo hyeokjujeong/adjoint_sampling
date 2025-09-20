@@ -76,6 +76,8 @@ def evaluation(
             sde, batch, cfg.eval_nfe, only_final_state=False
         )
         # print(energy_model(graph_state))
+        #
+        #energy_model.eval()
         output = energy_model(graph_state)
 
         # torch.save(graph_state, "samples.pt")
@@ -100,19 +102,11 @@ def evaluation(
     soc_loss = (soc_loss / cfg.num_eval_samples).detach().cpu().item()
     if cfg.conformers_file is not None:
         path = to_absolute_path(cfg.conformers_file)
-        loader = xyz_to_loader(path, cfg.eval_smiles, energy_model, batch_size=cfg.eval_batch_size)
-        conformer_outputs = {}
-        with torch.no_grad(): # conformer_outputs are used only for visualization
-            for batch in loader:
-                partial_outputs = energy_model(
-                    batch.to(device), regularize=False
-                )
-                for k, v in partial_outputs.items():
-                    assert v.dim() == 2, "outputs of the energy model is assumed to be 2D tensors"
-                    if k not in conformer_outputs:
-                        conformer_outputs[k] = v
-                    else:
-                        conformer_outputs[k] = torch.cat([conformer_outputs[k], v], dim=0)
+        #loader = xyz_to_loader(path, cfg.eval_smiles, energy_model, batch_size=cfg.eval_batch_size)
+        loader = xyz_to_loader(path, cfg.eval_smiles, energy_model)
+        conformer_outputs = energy_model(
+            next(iter(loader)).to(device), regularize=False
+        )
 
         # print(conformer_outputs['energy'])
         # conformer_energies = output["energy"].detach().cpu().numpy()

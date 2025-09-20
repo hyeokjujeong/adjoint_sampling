@@ -105,7 +105,7 @@ def init_distributed_mode(cfg):
             init_method=cfg.dist_url,
             world_size=cfg.world_size,
             rank=cfg.rank,
-            timeout=timedelta(hours=1),
+            timeout=timedelta(seconds=240),
         )
         torch.distributed.barrier()
         setup_for_distributed(cfg.rank == 0)

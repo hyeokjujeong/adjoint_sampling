@@ -6,7 +6,7 @@ import sys
 
 import traceback
 from pathlib import Path
-
+import torch.distributed as dist
 import adjoint_sampling.utils.distributed_mode as distributed_mode
 import hydra
 import numpy as np
@@ -36,6 +36,11 @@ from tqdm import tqdm
 
 
 cudnn.benchmark = True
+def mem(tag):
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserv = torch.cuda.memory_reserved() / 1e9
+    print(f"[{tag}] alloc={alloc:.2f}GB, reserved={reserv:.2f}GB", flush=True)
 
 
 @hydra.main(config_path="configs", config_name="train.yaml", version_base="1.1")
@@ -84,7 +89,7 @@ def main(cfg):
         if cfg.learn_torsions:
             torch.set_default_dtype(torch.float64)
 
-        controller = hydra.utils.instantiate(cfg.controller)
+        controller = hydra.utils.instantiate(cfg.controller).to(device)
         checkpoint_dir = "checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Check for existing checkpoints
@@ -125,7 +130,7 @@ def main(cfg):
             )
 
         lr_schedule = None
-        optimizer = torch.optim.Adam(list(sde.parameters()), lr=cfg.lr)
+        optimizer = torch.optim. Adam(list(sde.parameters()), lr=cfg.lr)
         if checkpoint is not None:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -151,6 +156,12 @@ def main(cfg):
         eval_sample_loader = torch_geometric.loader.DataLoader(
             dataset=eval_sample_dataset,
             batch_size=cfg.batch_size,
+            sampler=torch.utils.data.DistributedSampler(
+                eval_sample_dataset,
+                num_replicas=world_size,
+                rank=global_rank,
+                shuffle=False,
+            ),
         )
 
         train_sample_dataset = hydra.utils.instantiate(cfg.dataset)(
@@ -179,9 +190,13 @@ def main(cfg):
         print(f"Starting from {cfg.start_epoch}/{cfg.num_epochs} epochs")
         pbar = tqdm(range(start_epoch, cfg.num_epochs))
         for epoch in pbar:
+            if isinstance(train_sample_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                train_sample_loader.sampler.set_epoch(epoch)
             if (
                 epoch == start_epoch
             ):  # should we reinitialize buffer randomly like this if resuming?
+                print("start epoch!!!!!!!!!", flush=True)
+                mem("before populating buffer")
                 if cfg.pretrain_epochs > 0:
                     buffer.add(
                         *populate_buffer_from_loader_rdkit(
@@ -210,6 +225,7 @@ def main(cfg):
                         )
                     )
             else:
+                print(f"epoch {epoch}", flush=True)
                 if epoch < cfg.pretrain_epochs:
                     buffer.add(
                         *populate_buffer_from_loader_rdkit(
@@ -236,8 +252,39 @@ def main(cfg):
                             discretization_scheme=cfg.discretization_scheme,
                         )
                     )
-            train_dataloader = buffer.get_data_loader(cfg.num_batches_per_epoch)
+            print("dataloader being loaded", flush=True)
+            mem("after populating buffer")
+            #train_dataloader = buffer.get_data_loader(cfg.num_batches_per_epoch)
+            train_dataloader = buffer.get_data_loader(distributed=cfg.distributed, shuffle=True, drop_last=True, num_workers=0)
+            mem("after making dataloader from buffer")
+            dl_len = len(train_dataloader)  # DistributedSampler 기반이면 각 랭크 동일한 길이를 가짐
+            print(f"[rank {distributed_mode.get_rank()}] dl_len={dl_len}", flush=True)
+            if cfg.distributed:
+                sampler = getattr(train_dataloader, "sampler", None)
+                if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+                    sampler.set_epoch(epoch)
+            """
+            blen = torch.tensor([len(buffer.batch_list)], device=device, dtype=torch.int64)
+            dist.all_reduce(blen, op=dist.ReduceOp.MIN); mn = blen.item()
+            blen = torch.tensor([len(buffer.batch_list)], device=device, dtype=torch.int64)
+            dist.all_reduce(blen, op=dist.ReduceOp.MAX); mx = blen.item()
+            if mn != mx:
+                raise RuntimeError(f"Buffer size differs across ranks: min={mn}, max={mx}")
+            it = iter(train_dataloader)
+            b0 = next(it)  # (graph_state, grad_dict)
+            gs0, _ = b0
+            n_systems0 = len(gs0["ptr"]) - 1
+            ok0 = torch.tensor([
+                int(n_systems0 > 0) & int(torch.isfinite(gs0["positions"]).all().item())
+            ], device=device)
 
+            # 모든 랭크가 같은 판단을 하도록 합쳐서 결정
+            dist.all_reduce(ok0, op=dist.ReduceOp.MIN)
+            if ok0.item() == 0:
+                if dist.get_rank() == 0:
+                    print("[global] invalid first batch (empty or nonfinite); skipping...", flush=True)
+            """
+            print("training one epoch", flush=True)
             train_dict = train_one_epoch(
                 controller,
                 noise_schedule,
@@ -250,6 +297,9 @@ def main(cfg):
                 cfg,
                 pretrain_mode=(epoch < cfg.pretrain_epochs),
             )
+            mem("after training one epoch")
+            print("one epoch trained", flush=True)
+            """
             if epoch % cfg.eval_freq == 0 or epoch == cfg.num_epochs - 1:
                 if distributed_mode.is_main_process():
                     try:
@@ -289,11 +339,49 @@ def main(cfg):
                                 mode, train_dict["loss"], eval_dict["soc_loss"]
                             )
                         )
+                        
                     except Exception as e:  # noqa: F841
                         # Log exception but don't stop training.
                         print(traceback.format_exc())
                         print(traceback.format_exc(), file=sys.stderr)
-
+                    """
+            if epoch % cfg.eval_freq == 0 or epoch == cfg.num_epochs - 1:
+                if cfg.distributed and dist.is_initialized():
+                    dist.barrier()  # 평가 들어가기 전에 보폭 맞춤
+                sde.control.eval()
+                mem("before evaluation")
+                eval_dict = evaluation(
+                    sde,
+                    energy_model,
+                    eval_sample_loader,
+                    noise_schedule,
+                    energy_model.atomic_numbers,
+                    global_rank,
+                    device,
+                    cfg,
+                )
+                mem("after evaluation")
+                if cfg.distributed and dist.is_initialized():
+                    dist.barrier()  # 평가 끝난 시점도 맞춤
+            
+                # 파일 저장/로그만 rank 0이 수행
+                if distributed_mode.is_main_process():
+                    eval_dict["energy_vis"].save("test_im.png")
+                    print("saving checkpoint ... ")
+                    state = {
+                        "controller_state_dict": (
+                            controller.module.state_dict() if cfg.distributed else controller.state_dict()
+                        ),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epoch": epoch,
+                    }
+                    torch.save(state, f"checkpoints/checkpoint_{epoch}.pt")
+                    torch.save(state, "checkpoints/checkpoint_latest.pt")
+                    mode = "pretrain" if epoch < cfg.pretrain_epochs else "adjoint sampling"
+                    pbar.set_description(
+                        f"mode: {mode}, train loss: {train_dict['loss']:.2f}, eval soc loss: {eval_dict['soc_loss']:.2f}"
+                    )
+            
     except Exception as e:
         # This way we have the full traceback in the log.  otherwise Hydra
         # will handle the exception and store only the error in a pkl file

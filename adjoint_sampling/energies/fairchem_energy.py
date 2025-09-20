@@ -50,15 +50,16 @@ class FairChemEnergy(torch.nn.Module):
                 checkpoint_path=model_ckpt, cpu=(device == "cpu"), seed=0
             )
         self.predictor = calculator.trainer
-        self.predictor.model.device = device
+        m = self.predictor.model
+        inner = m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
 
-        self.predictor.model.backbone.use_pbc = True
-        self.predictor.model.backbone.use_pbc_single = False
+        inner.backbone.use_pbc = True
+        inner.backbone.use_pbc_single = False
 
         self.device = device
         self.tau = tau
         self.alpha = alpha
-        self.r_max = self.predictor.model.backbone.cutoff
+        self.r_max = inner.backbone.cutoff
         self.atomic_numbers = torch.arange(100)
         self.default_regularize = default_regularize
 

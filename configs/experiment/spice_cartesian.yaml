@@ -43,4 +43,4 @@ tau : 5e-3
 alpha : 100.0
 
 eval_smiles: CCCCOc1ccc(N2C(=O)CC(N(CCCl)CCCl)C2=O)cc1
-conformers_file: data/spice_test_conformers/rot10_2fc9a7c6e8/crest_conformers.xyz
+conformers_file: data/spice_test_conformers/rot10_2fc9a7c6e8/crest_temp.xyz
