@@ -1,5 +1,38 @@
 # Adjoint Sampling
 
+## Modifications for make it run with torchrun
+
+You need to set the "local_rank" argument appropriately in OCPCalculator.__init__() (this class is instantiated in adjoint_sampling/energies/fairchem_energy.py).
+
+You have to modify fairchem code. Go to the directory where fairchem is installed and find `fairchem/core/common/relaxation/ase_utils.py`.
+For example, `/home/hjjeong/anaconda3/envs/adjoint_sampling/lib/python3.12/site-packages/fairchem/core/common/relaxation/ase_utils.py`.
+
+In ase_utils.py, inside OCPCalculator.__init__() (around line 215), you will see:
+```
+### backwards compatability with OCP v<2.0
+config = update_config(config)
+
+self.config = copy.deepcopy(config)
+self.config["checkpoint"] = str(checkpoint_path)
+del config["dataset"]["src"]
+```
+
+You should add the following lines:
+```
+### backwards compatability with OCP v<2.0
+config = update_config(config)
+import os
+config["local_rank"] = int(os.environ.get("LOCAL_RANK", 0))
+if not cpu:
+    torch.cuda.set_device(config["local_rank"])
+
+self.config = copy.deepcopy(config)
+self.config["checkpoint"] = str(checkpoint_path)
+del config["dataset"]["src"]
+```
+
+-----
+
 This repository contains the official implementation and experiments for Adjoint Sampling: Highly Scalable Diffusion
 Samplers via Adjoint Matching.
 
